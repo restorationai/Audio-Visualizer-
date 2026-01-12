@@ -17,25 +17,35 @@ const RATIO_VALUES: Record<AspectRatio, number> = {
 const loadFFmpeg = async () => {
   if (ffmpeg) return ffmpeg;
 
-  const loadScript = (url: string) => new Promise((resolve) => {
+  const loadScript = (url: string) => new Promise((resolve, reject) => {
     const script = document.createElement('script');
     script.src = url;
     script.onload = resolve;
+    script.onerror = () => reject(new Error(`Failed to load script: ${url}`));
     document.head.appendChild(script);
   });
 
-  await loadScript(FFMPEG_URL);
-  await loadScript(UTIL_URL);
+  try {
+    await loadScript(FFMPEG_URL);
+    await loadScript(UTIL_URL);
 
-  const { FFmpeg } = (window as any).FFmpeg;
-  ffmpeg = new FFmpeg();
-  
-  await ffmpeg.load({
-    coreURL: 'https://unpkg.com/@ffmpeg/core@0.12.6/dist/umd/ffmpeg-core.js',
-    wasmURL: 'https://unpkg.com/@ffmpeg/core@0.12.6/dist/umd/ffmpeg-core.wasm',
-  });
-
-  return ffmpeg;
+    const { FFmpeg } = (window as any).FFmpeg;
+    ffmpeg = new FFmpeg();
+    
+    // Log loading process
+    console.log("Initializing FFmpeg Core...");
+    
+    await ffmpeg.load({
+      coreURL: 'https://unpkg.com/@ffmpeg/core@0.12.6/dist/umd/ffmpeg-core.js',
+      wasmURL: 'https://unpkg.com/@ffmpeg/core@0.12.6/dist/umd/ffmpeg-core.wasm',
+    });
+    
+    console.log("FFmpeg Core loaded successfully.");
+    return ffmpeg;
+  } catch (err) {
+    console.error("FFmpeg Load Error:", err);
+    throw err;
+  }
 };
 
 export const renderVideo = async (
@@ -50,6 +60,7 @@ export const renderVideo = async (
     const ffmpegInstance = await loadFFmpeg();
     const { fetchFile } = (window as any).FFmpegUtil;
 
+    console.log("Writing input files to virtual filesystem...");
     await ffmpegInstance.writeFile('input.png', await fetchFile(image));
     
     const inputs = ['-i', 'input.png'];
@@ -74,10 +85,10 @@ export const renderVideo = async (
     let width = baseDim;
     let height = baseDim;
 
-    if (ratio >= 1) { // Landscape or Square
+    if (ratio >= 1) { 
       width = Math.floor(baseDim * ratio);
       height = baseDim;
-    } else { // Portrait
+    } else { 
       width = baseDim;
       height = Math.floor(baseDim / ratio);
     }
@@ -87,8 +98,6 @@ export const renderVideo = async (
 
     const vA = settings.visualizerA;
     const vB = settings.visualizerB;
-
-    // FFmpeg showwaves color parsing: prefers 0xRRGGBB format
     const formatColor = (c: string) => `0x${c.replace('#', '')}`;
 
     filterParts.push(`[0:v]scale=${width}:${height}:force_original_aspect_ratio=decrease,pad=${width}:${height}:(ow-iw)/2:(oh-ih)/2,format=yuv420p[bg]`);
@@ -117,13 +126,11 @@ export const renderVideo = async (
       lastVideoLabel = '[v]';
       currentInputIdx++;
     } else if (audioA) {
-      // Finalize the label if only A was used
       filterParts[filterParts.length - 1] = filterParts[filterParts.length - 1].replace('[tmpA]', '[v]');
     } else {
       filterParts.push(`[bg]null[v]`);
     }
 
-    // Audio mixing
     if (audioInputCount === 2) {
       filterParts.push(`[1:a][2:a]amix=inputs=2:duration=longest:dropout_transition=0[a]`);
     } else if (audioInputCount === 1) {
@@ -131,6 +138,7 @@ export const renderVideo = async (
     }
 
     const filter = filterParts.join('; ');
+    console.log("Filter Complex:", filter);
 
     ffmpegInstance.on('progress', ({ progress }: { progress: number }) => {
       onProgress(Math.floor(20 + (progress * 80)));
@@ -153,13 +161,15 @@ export const renderVideo = async (
       '-shortest', 'output.mp4'
     );
 
+    console.log("Starting FFmpeg execution...");
     await ffmpegInstance.exec(execArgs);
 
     const data = await ffmpegInstance.readFile('output.mp4');
     onProgress(100);
+    console.log("Render completed successfully.");
     return URL.createObjectURL(new Blob([(data as any).buffer], { type: 'video/mp4' }));
   } catch (error: any) {
-    console.error(error);
+    console.error("FFmpeg Execution Error:", error);
     throw new Error(`Render Failed: ${error.message}`);
   }
 };
