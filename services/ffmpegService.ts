@@ -1,14 +1,13 @@
 import { RenderSettings, AspectRatio } from '../types';
+import { FFmpeg } from '@ffmpeg/ffmpeg';
+import { fetchFile, toBlobURL } from '@ffmpeg/util';
 
-const FFMPEG_URL = 'https://unpkg.com/@ffmpeg/ffmpeg@0.12.7/dist/umd/ffmpeg.js';
-const UTIL_URL = 'https://unpkg.com/@ffmpeg/util@0.12.1/dist/umd/index.js';
-
-let ffmpeg: any = null;
+let ffmpeg: FFmpeg | null = null;
 
 const RATIO_VALUES: Record<AspectRatio, number> = {
   '9:16': 9 / 16,
   '16:9': 16 / 9,
-  '1:1': 1 / 1,
+  '1:1': 1,
   '4:5': 4 / 5,
   '2:3': 2 / 3,
   '3:4': 3 / 4,
@@ -17,35 +16,16 @@ const RATIO_VALUES: Record<AspectRatio, number> = {
 const loadFFmpeg = async () => {
   if (ffmpeg) return ffmpeg;
 
-  const loadScript = (url: string) => new Promise((resolve, reject) => {
-    const script = document.createElement('script');
-    script.src = url;
-    script.onload = resolve;
-    script.onerror = () => reject(new Error(`Failed to load script: ${url}`));
-    document.head.appendChild(script);
+  ffmpeg = new FFmpeg();
+
+  const baseURL = 'https://unpkg.com/@ffmpeg/core@0.12.6/dist/umd';
+
+  await ffmpeg.load({
+    coreURL: await toBlobURL(`${baseURL}/ffmpeg-core.js`, 'text/javascript'),
+    wasmURL: await toBlobURL(`${baseURL}/ffmpeg-core.wasm`, 'application/wasm'),
   });
 
-  try {
-    await loadScript(FFMPEG_URL);
-    await loadScript(UTIL_URL);
-
-    const { FFmpeg } = (window as any).FFmpeg;
-    ffmpeg = new FFmpeg();
-    
-    // Log loading process
-    console.log("Initializing FFmpeg Core...");
-    
-    await ffmpeg.load({
-      coreURL: 'https://unpkg.com/@ffmpeg/core@0.12.6/dist/umd/ffmpeg-core.js',
-      wasmURL: 'https://unpkg.com/@ffmpeg/core@0.12.6/dist/umd/ffmpeg-core.wasm',
-    });
-    
-    console.log("FFmpeg Core loaded successfully.");
-    return ffmpeg;
-  } catch (err) {
-    console.error("FFmpeg Load Error:", err);
-    throw err;
-  }
+  return ffmpeg;
 };
 
 export const renderVideo = async (
@@ -57,119 +37,94 @@ export const renderVideo = async (
 ): Promise<string> => {
   try {
     onProgress(5);
-    const ffmpegInstance = await loadFFmpeg();
-    const { fetchFile } = (window as any).FFmpegUtil;
 
-    console.log("Writing input files to virtual filesystem...");
-    await ffmpegInstance.writeFile('input.png', await fetchFile(image));
-    
-    const inputs = ['-i', 'input.png'];
-    const filterParts = [];
-    let audioInputCount = 0;
+    const ffmpeg = await loadFFmpeg();
+
+    await ffmpeg.writeFile('input.png', await fetchFile(image));
+
+    const inputs: string[] = ['-i', 'input.png'];
+    let audioCount = 0;
 
     if (audioA) {
-      await ffmpegInstance.writeFile('audioA.mp3', await fetchFile(audioA));
-      inputs.push('-i', 'audioA.mp3');
-      audioInputCount++;
+      await ffmpeg.writeFile('a.mp3', await fetchFile(audioA));
+      inputs.push('-i', 'a.mp3');
+      audioCount++;
     }
+
     if (audioB) {
-      await ffmpegInstance.writeFile('audioB.mp3', await fetchFile(audioB));
-      inputs.push('-i', 'audioB.mp3');
-      audioInputCount++;
+      await ffmpeg.writeFile('b.mp3', await fetchFile(audioB));
+      inputs.push('-i', 'b.mp3');
+      audioCount++;
     }
 
-    // Resolution Calculation
-    const baseDim = settings.resolution === '4K' ? 2160 : 1080;
+    const base = settings.resolution === '4K' ? 2160 : 1080;
     const ratio = RATIO_VALUES[settings.aspectRatio];
-    
-    let width = baseDim;
-    let height = baseDim;
 
-    if (ratio >= 1) { 
-      width = Math.floor(baseDim * ratio);
-      height = baseDim;
-    } else { 
-      width = baseDim;
-      height = Math.floor(baseDim / ratio);
-    }
-    
-    width = (width >> 1) << 1; 
+    let width = ratio >= 1 ? Math.floor(base * ratio) : base;
+    let height = ratio >= 1 ? base : Math.floor(base / ratio);
+
+    width = (width >> 1) << 1;
     height = (height >> 1) << 1;
 
     const vA = settings.visualizerA;
     const vB = settings.visualizerB;
-    const formatColor = (c: string) => `0x${c.replace('#', '')}`;
 
-    filterParts.push(`[0:v]scale=${width}:${height}:force_original_aspect_ratio=decrease,pad=${width}:${height}:(ow-iw)/2:(oh-ih)/2,format=yuv420p[bg]`);
+    const fx: string[] = [
+      `[0:v]scale=${width}:${height}:force_original_aspect_ratio=decrease,pad=${width}:${height}:(ow-iw)/2:(oh-ih)/2[bg]`
+    ];
 
-    let currentInputIdx = 1;
-    let lastVideoLabel = '[bg]';
+    let idx = 1;
+    let last = '[bg]';
 
     if (audioA) {
-      const ax = Math.floor((vA.x / 100) * width);
-      const ay = Math.floor((vA.y / 100) * height);
-      const aw = Math.max(2, (Math.floor((vA.width / 100) * width) >> 1) << 1);
-      const ah = Math.max(2, (Math.floor((vA.height / 100) * height) >> 1) << 1);
-      filterParts.push(`[${currentInputIdx}:a]showwaves=s=${aw}x${ah}:colors=${formatColor(vA.color)}:mode=line:rate=30,format=rgba,colorkey=0x000000:0.1[vA]`);
-      filterParts.push(`${lastVideoLabel}[vA]overlay=${ax}:${ay}[tmpA]`);
-      lastVideoLabel = '[tmpA]';
-      currentInputIdx++;
+      fx.push(
+        `[${idx}:a]showwaves=s=${Math.floor(width * vA.width / 100)}x${Math.floor(height * vA.height / 100)}:colors=0x${vA.color.replace('#','')}:mode=line,format=rgba[vA]`,
+        `${last}[vA]overlay=${Math.floor(width * vA.x / 100)}:${Math.floor(height * vA.y / 100)}[tmpA]`
+      );
+      last = '[tmpA]';
+      idx++;
     }
 
     if (audioB) {
-      const bx = Math.floor((vB.x / 100) * width);
-      const by = Math.floor((vB.y / 100) * height);
-      const bw = Math.max(2, (Math.floor((vB.width / 100) * width) >> 1) << 1);
-      const bh = Math.max(2, (Math.floor((vB.height / 100) * height) >> 1) << 1);
-      filterParts.push(`[${currentInputIdx}:a]showwaves=s=${bw}x${bh}:colors=${formatColor(vB.color)}:mode=line:rate=30,format=rgba,colorkey=0x000000:0.1[vB]`);
-      filterParts.push(`${lastVideoLabel}[vB]overlay=${bx}:${by}[v]`);
-      lastVideoLabel = '[v]';
-      currentInputIdx++;
-    } else if (audioA) {
-      filterParts[filterParts.length - 1] = filterParts[filterParts.length - 1].replace('[tmpA]', '[v]');
+      fx.push(
+        `[${idx}:a]showwaves=s=${Math.floor(width * vB.width / 100)}x${Math.floor(height * vB.height / 100)}:colors=0x${vB.color.replace('#','')}:mode=line,format=rgba[vB]`,
+        `${last}[vB]overlay=${Math.floor(width * vB.x / 100)}:${Math.floor(height * vB.y / 100)}[v]`
+      );
     } else {
-      filterParts.push(`[bg]null[v]`);
+      fx.push(`${last}null[v]`);
     }
 
-    if (audioInputCount === 2) {
-      filterParts.push(`[1:a][2:a]amix=inputs=2:duration=longest:dropout_transition=0[a]`);
-    } else if (audioInputCount === 1) {
-      filterParts.push(`[1:a]anull[a]`);
+    if (audioCount === 2) {
+      fx.push(`[1:a][2:a]amix=inputs=2[a]`);
+    } else if (audioCount === 1) {
+      fx.push(`[1:a]anull[a]`);
     }
 
-    const filter = filterParts.join('; ');
-    console.log("Filter Complex:", filter);
-
-    ffmpegInstance.on('progress', ({ progress }: { progress: number }) => {
-      onProgress(Math.floor(20 + (progress * 80)));
+    ffmpeg.on('progress', ({ progress }) => {
+      onProgress(20 + Math.floor(progress * 80));
     });
 
-    const execArgs = [
+    await ffmpeg.exec([
       ...inputs,
-      '-filter_complex', filter,
-      '-map', '[v]'
-    ];
-    
-    if (audioInputCount > 0) {
-      execArgs.push('-map', '[a]');
-    }
-
-    execArgs.push(
-      '-c:v', 'libx264', 
-      '-preset', 'ultrafast', 
+      '-filter_complex', fx.join(';'),
+      '-map', '[v]',
+      ...(audioCount ? ['-map', '[a]'] : []),
+      '-c:v', 'libx264',
+      '-preset', 'ultrafast',
       '-pix_fmt', 'yuv420p',
-      '-shortest', 'output.mp4'
+      '-shortest',
+      'out.mp4'
+    ]);
+
+    const data = await ffmpeg.readFile('out.mp4');
+    onProgress(100);
+
+    return URL.createObjectURL(
+      new Blob([data.buffer], { type: 'video/mp4' })
     );
 
-    console.log("Starting FFmpeg execution...");
-    await ffmpegInstance.exec(execArgs);
-
-    const data = await ffmpegInstance.readFile('output.mp4');
-    onProgress(100);
-    console.log("Render completed successfully.");
-    return URL.createObjectURL(new Blob([(data as any).buffer], { type: 'video/mp4' }));
-  } catch (error: any) {
-    console.error("FFmpeg Execution Error:", error);
-    throw new Error(`Render Failed: ${error.message}`);
+  } catch (err: any) {
+    console.error(err);
+    throw new Error(`Render failed: ${err.message}`);
   }
 };
